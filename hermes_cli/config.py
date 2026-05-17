@@ -1466,6 +1466,12 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # When true, each gateway dispatcher tick also looks for triage-column
+        # tasks whose body is missing/sparse and runs the triage specifier to
+        # enrich them from board context before normal worker dispatch. Capped
+        # per tick to avoid unbounded auxiliary calls after large imports.
+        "auto_specify_triage_without_details": False,
+        "auto_specify_triage_limit_per_tick": 1,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

@@ -3177,6 +3177,10 @@ def test_config_default_dispatch_in_gateway_is_true():
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+    assert kanban.get("auto_specify_triage_without_details") is False, (
+        "auto triage specification should be opt-in because it spends auxiliary tokens"
+    )
+    assert kanban.get("auto_specify_triage_limit_per_tick") == 1
 
 
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):

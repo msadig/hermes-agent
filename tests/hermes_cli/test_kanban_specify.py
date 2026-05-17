@@ -112,6 +112,44 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def test_specify_task_investigates_worker_context_comments(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+        kb.add_comment(conn, tid, "sadig", "Important context: use ~/src/payments")
+
+    content = jsonlib.dumps({"title": "Refined rough", "body": "body"})
+    p, client = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is True
+    call = client.chat.completions.create.call_args
+    user_msg = call.kwargs["messages"][1]["content"]
+    assert "Worker-context dump to investigate" in user_msg
+    assert "Important context: use ~/src/payments" in user_msg
+
+
+def test_triage_without_details_filter(kanban_home):
+    detailed_body = (
+        "**Goal**\nDo the thing with enough project detail to guide a worker.\n\n"
+        "**Approach**\n- Use the existing context.\n"
+        "- Preserve prior decisions and paths mentioned by the user.\n"
+        "- Keep implementation scoped to the named component only.\n\n"
+        "**Acceptance criteria**\n- Verified by tests.\n"
+        "- Documentation or handoff notes explain the outcome.\n"
+    )
+    with kb.connect() as conn:
+        empty = kb.create_task(conn, title="empty", triage=True)
+        short = kb.create_task(conn, title="short", body="tiny note", triage=True)
+        detailed = kb.create_task(conn, title="detailed", body=detailed_body, triage=True)
+        ready = kb.create_task(conn, title="ready", body="", triage=False)
+
+    assert spec.list_triage_ids(only_without_details=True) == [empty, short]
+    assert spec.list_triage_ids() == [empty, short, detailed]
+    with kb.connect() as conn:
+        assert spec.task_needs_context_enrichment(kb.get_task(conn, ready)) is False
+
+
 def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="keep title", triage=True)

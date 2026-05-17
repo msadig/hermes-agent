@@ -4667,6 +4667,23 @@ class GatewayRunner:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        auto_specify_triage = bool(
+            kanban_cfg.get("auto_specify_triage_without_details", False)
+        )
+        raw_auto_specify_limit = kanban_cfg.get(
+            "auto_specify_triage_limit_per_tick", 1
+        )
+        try:
+            auto_specify_limit = int(raw_auto_specify_limit)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.auto_specify_triage_limit_per_tick=%r; using 1",
+                raw_auto_specify_limit,
+            )
+            auto_specify_limit = 1
+        if auto_specify_limit < 0:
+            auto_specify_limit = 0
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -4697,6 +4714,36 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                if auto_specify_triage and auto_specify_limit > 0:
+                    try:
+                        from hermes_cli import kanban_specify as _ks
+
+                        # `specify_task()` opens its own connection, so close
+                        # this tick's idle connection first; otherwise the
+                        # auxiliary call would hold an unnecessary sqlite
+                        # handle while it waits on the provider.
+                        conn.close()
+                        conn = None
+                        outcomes = _ks.specify_triage_without_details(
+                            author="gateway-triage-rule",
+                            limit=auto_specify_limit,
+                            board=slug,
+                        )
+                        ok_count = sum(1 for o in outcomes if o.ok)
+                        if outcomes:
+                            logger.info(
+                                "kanban dispatcher [%s]: triage enrichment ok=%d failed=%d",
+                                slug,
+                                ok_count,
+                                len(outcomes) - ok_count,
+                            )
+                        conn = _kb.connect(board=slug)
+                    except Exception:
+                        logger.exception(
+                            "kanban dispatcher: triage enrichment failed on board %s",
+                            slug,
+                        )
+                        conn = _kb.connect(board=slug)
                 return _kb.dispatch_once(
                     conn,
                     board=slug,

@@ -1,8 +1,10 @@
 """Kanban triage specifier — flesh out a one-liner into a real spec.
 
-Used by ``hermes kanban specify [task_id | --all]``. Takes a task that
-lives in the Triage column (a rough idea, typically only a title), calls
-the auxiliary LLM to produce:
+Used by ``hermes kanban specify [task_id | --all]`` and by the optional
+gateway triage sweeper. Takes a task that lives in the Triage column (a
+rough idea, typically only a title), gathers the board context already
+known to Hermes (parent handoffs, comments, workspace hints, retry trail),
+then calls the auxiliary LLM to produce:
 
   * A tightened title (optional — only replaces if the model proposes a
     materially different one)
@@ -19,10 +21,11 @@ Design notes
   client pattern, same "empty config => skip, don't crash" tolerance.
   Keeps the surface area tiny and the failure modes predictable.
 
-* The prompt is a short system + user pair. We ask for JSON with
-  ``{title, body}``; if parsing fails, we fall back to treating the
-  whole response as the body and leave the title untouched. No
-  retry loop — one shot, keep cost bounded.
+* The prompt is a short system + user pair with the same worker-context
+  dump a spawned worker would see. We ask for JSON with ``{title, body}``;
+  if parsing fails, we fall back to treating the whole response as the
+  body and leave the title untouched. No retry loop — one shot, keep cost
+  bounded.
 
 * Structured output / JSON mode is not requested explicitly so the
   specifier works on providers that don't implement it. The parse
@@ -48,6 +51,12 @@ A user dropped a rough idea into the Triage column. Your job is to turn it
 into a concrete, actionable task spec that an autonomous worker can pick up
 and execute without further clarification.
 
+Before writing the spec, investigate the provided board context: task body,
+parent-task handoffs, comments, prior attempts, workspace hints, and any other
+context in the worker-context dump. Preserve useful facts from that context in
+the output body so downstream workers do not have to rediscover them. If the
+context is sparse, say so explicitly in the spec instead of inventing details.
+
 Output a single JSON object with exactly two keys:
 
   {
@@ -69,6 +78,9 @@ Rules:
     NOT invent a different project.
   - If the original idea is already detailed, preserve its substance and
     just reformat into the sections above.
+  - Include a brief "Context found" bullet under **Approach** whenever the
+    board context supplies concrete constraints, paths, parent results, or
+    decisions relevant to execution.
   - Never add invented requirements the user didn't hint at.
   - No preamble, no closing remarks, no code fences around the JSON.
   - Output only the JSON object and nothing else.
@@ -79,7 +91,21 @@ _USER_TEMPLATE = """Task id: {task_id}
 Current title: {title}
 Current body:
 {body}
+
+Worker-context dump to investigate and preserve:
+{worker_context}
 """
+
+
+_DETAIL_MARKERS = (
+    "**goal**",
+    "**approach**",
+    "**acceptance criteria**",
+    "acceptance criteria",
+    "context found",
+    "requirements",
+    "out of scope",
+)
 
 
 @dataclass
@@ -132,11 +158,32 @@ def _profile_author() -> str:
     )
 
 
+def task_needs_context_enrichment(task: kb.Task) -> bool:
+    """Return True for triage tasks that are still missing usable detail.
+
+    Triage is allowed to contain already-rich task specs for human review;
+    those should not be churned by an automatic sweep. The rule is
+    intentionally conservative: empty/very-short bodies are enriched, and
+    longer bodies are considered detailed when they already carry common spec
+    markers.
+    """
+    if task.status != "triage":
+        return False
+    body = (task.body or "").strip()
+    if not body:
+        return True
+    if len(body) < 160:
+        return True
+    folded = body.casefold()
+    return not any(marker in folded for marker in _DETAIL_MARKERS)
+
+
 def specify_task(
     task_id: str,
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> SpecifyOutcome:
     """Specify a single triage task and promote it to ``todo``.
 
@@ -145,7 +192,7 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
-    with kb.connect() as conn:
+    with kb.connect(board=board) as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
@@ -171,10 +218,18 @@ def specify_task(
             task_id, False, "no auxiliary client configured"
         )
 
+    with kb.connect(board=board) as conn:
+        try:
+            worker_context = kb.build_worker_context(conn, task.id)
+        except Exception as exc:
+            logger.debug("specify: failed to build worker context for %s: %s", task.id, exc)
+            worker_context = "(worker context unavailable)"
+
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        worker_context=_truncate(worker_context or "(no worker context)", 8000),
     )
 
     try:
@@ -234,7 +289,7 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
-    with kb.connect() as conn:
+    with kb.connect(board=board) as conn:
         ok = kb.specify_triage_task(
             conn,
             task_id,
@@ -251,16 +306,53 @@ def specify_task(
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    only_without_details: bool = False,
+    board: Optional[str] = None,
+) -> list[str]:
     """Return task ids currently in the triage column.
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
+    ``only_without_details`` applies the enrichment rule used by the gateway
+    auto-sweeper: return only triage cards whose body is empty/too sparse.
+    ``board`` selects a non-default board without relying on env vars.
     """
-    with kb.connect() as conn:
+    with kb.connect(board=board) as conn:
         tasks = kb.list_tasks(
             conn,
             status="triage",
             tenant=tenant,
             include_archived=False,
         )
+    if only_without_details:
+        tasks = [t for t in tasks if task_needs_context_enrichment(t)]
     return [t.id for t in tasks]
+
+
+def specify_triage_without_details(
+    *,
+    tenant: Optional[str] = None,
+    author: Optional[str] = None,
+    limit: int = 1,
+    board: Optional[str] = None,
+) -> list[SpecifyOutcome]:
+    """Specify up to ``limit`` sparse triage tasks.
+
+    This is the automation-friendly rule entry point. It intentionally caps
+    each sweep so a gateway tick cannot fan out unbounded auxiliary calls after
+    a large import dumps many placeholder cards into triage.
+    """
+    try:
+        limit_int = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit_int = 1
+    if limit_int <= 0:
+        return []
+    ids = list_triage_ids(
+        tenant=tenant,
+        only_without_details=True,
+        board=board,
+    )[:limit_int]
+    return [specify_task(tid, author=author, board=board) for tid in ids]
